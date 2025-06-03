@@ -3,8 +3,8 @@ import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
 
 export type TestCase = {
-  input: string;           // customer’s question to the bank chatbot
-  expected_output: string; // the concise, correct answer the chatbot should return
+  input: string;
+  expected_output: string;
 };
 
 export class TestAgent {
@@ -19,34 +19,25 @@ export class TestAgent {
   }
 
   /**
-   * 1) Call OpenAI to produce a batch of random bank‐chatbot test cases.
-   * 2) Parse and return a JSON array of TestCase objects.
+   * 1) Call the LLM to produce a batch of candidate TestCases.
+   * 2) Parse and return a JSON array (or [] if parsing fails).
    */
   async callGeneratorModel(): Promise<unknown[]> {
     const completion = await generateText({
       model: openai("gpt-3.5-turbo"),
       prompt: `
-You are a bank‐customer‐service test‐case generator. Produce exactly ${this.targetCount} random customer questions that someone might ask a banking chatbot, along with the concise, correct response the chatbot should give. Make sure:
-  • Each question covers a distinct topic (e.g., account balance inquiry, transaction dispute, card replacement, loan interest rates, fraud reporting).
-  • Questions vary in phrasing and complexity (formal, informal, multi‐part).
-  • Expected answers are realistic and to‐the‐point (e.g., numerical values, process steps, policy explanations).
+You are a test-case generator. Given this input:
+${this.gold.input}
 
-Return your answer as a pure JSON array (no extra text). The array should look like:
-[
-  {
-    "input": "Customer question here…",
-    "expected_output": "Correct chatbot response here…"
-  },
-  { … }, 
-  … total of ${this.targetCount} objects …
-]
+• Return exactly ${this.targetCount} objects in a JSON array.
+• Each object must have "input" (string) and "expected_output" (string).
+• Do not output any extra text—only valid JSON.
 `,
-      max_tokens: 700,
-      temperature: 0.8,
+      maxTokens: 700,      // ← changed from max_tokens
+      temperature: 0.8,    // keep as-is
     });
 
     console.log("⟳ Generator raw text:", completion.text);
-
     try {
       return JSON.parse(completion.text) as unknown[];
     } catch (error) {
@@ -56,42 +47,40 @@ Return your answer as a pure JSON array (no extra text). The array should look l
   }
 
   /**
-   * Ask the LLM if this candidate question is distinct from already‐accepted ones.
-   * Returns true only if the LLM answers “YES” exactly.
+   * Ask the LLM to validate a single candidate. Returns true if LLM answers "YES".
    */
   async callValidatorModel(tc: TestCase): Promise<boolean> {
     const completion = await generateText({
       model: openai("gpt-3.5-turbo"),
       prompt: `
-You are a validation assistant for bank‐chatbot test cases.
+You are a validation assistant.
+Gold example:
+  Input: "${this.gold.input}"
+  Expected: "${this.gold.expected_output}"
 
-New candidate test‐case:
-  Question: "${tc.input}"
-  Expected Answer: "${tc.expected_output}"
+New candidate:
+  Input: "${tc.input}"
+  Expected: "${tc.expected_output}"
 
-Existing accepted questions so far:
-${this.generated.map((t, i) => `  ${i + 1}. "${t.input}"`).join("\n")}
-
-Question: Is the “New candidate” question completely distinct in topic, wording, and complexity from all previously accepted questions, and would it require a different reasoning path? 
-Answer in exactly one word: YES or NO. Do NOT output anything else.
+Question: Does this candidate test the same functionality as the gold but in a unique way? 
+Answer "YES" or "NO" and nothing else.
 `,
-      max_tokens: 10,
-      temperature: 0.0,
+      maxTokens: 20,       // ← changed from max_tokens
+      temperature: 0.0,    // deterministic
     });
-
     const answer = completion.text.trim().toUpperCase();
-    console.log("⚡ Validator raw answer for:", tc.input, "→", `"${answer}"`);
+    console.log("⚡ Validator raw answer:", `"${answer}"`);
     return answer.startsWith("YES");
   }
 
   /**
-   * Basic uniqueness filter: drop if candidate.input exactly
-   * matches any already‐accepted question.
+   * Return false if candidate.input exactly matches gold.input
+   * or duplicates an already‐accepted test.
    */
   isUnique(candidate: TestCase): boolean {
+    if (candidate.input.trim() === this.gold.input.trim()) return false;
     for (const existing of this.generated) {
       if (existing.input.trim() === candidate.input.trim()) {
-        console.log("⦻ Dropped (duplicate prompt):", candidate.input);
         return false;
       }
     }
@@ -102,27 +91,23 @@ Answer in exactly one word: YES or NO. Do NOT output anything else.
    * Main “agent” loop:
    * 1) Call generator → parse → get array of unknown
    * 2) For each parsed TestCase:
-   *    a) sanity‐check (has input & expected_output as strings)
-   *    b) uniqueness check (no exact‐string match against generated[])
-   *    c) LLM validator (ensures distinctness)
+   *    a) syntactic sanity (has input, expected_output as strings)
+   *    b) check uniqueness
+   *    c) ask validator LLM (callValidatorModel)
    *    d) if passes, add to this.generated
-   * 3) Repeat until we have targetCount or hit maxAttempts
+   * 3) Repeat until we collect `targetCount` or hit maxAttempts
    */
   async run(): Promise<TestCase[]> {
-    this.generated = [];
-    this.attempts = 0;
-
     while (
       this.generated.length < this.targetCount &&
       this.attempts < this.maxAttempts
     ) {
       this.attempts++;
 
-      // 1) Get raw candidates
       const rawArr = await this.callGeneratorModel();
       const parsed: TestCase[] = [];
 
-      // 2a) Keep only well‐formed objects
+      // 2a) Keep only objects with correct shape
       for (const item of rawArr) {
         if (
           typeof item === "object" &&
@@ -136,7 +121,7 @@ Answer in exactly one word: YES or NO. Do NOT output anything else.
         }
       }
 
-      // 2b‐2d) Uniqueness + LLM‐validator
+      // 2b‐2d) Uniqueness + LLM validation
       for (const candidate of parsed) {
         if (this.generated.length >= this.targetCount) break;
         if (!this.isUnique(candidate)) continue;

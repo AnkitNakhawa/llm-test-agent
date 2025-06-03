@@ -1,90 +1,91 @@
 // lib/PromptQualityValidator.ts
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
-import type { BankTestCase } from "./HardPromptAgent.ts"; // type-only
+import type { BankTestCase } from "./HardPromptAgent.ts";
 
 export type ValidatedCase = BankTestCase & {
-  qualityScore: number;    // from 1 (very easy/clear) to 10 (very hard/edge‐case)
-  justification: string;    // brief LLM explanation for this score
+  qualityScore: number;    // 1 (easy) → 10 (extremely hard)
+  justification: string;
 };
 
 export class PromptQualityValidator {
-  maxTokens: number;
-  constructor(maxTokens = 100) {
-    this.maxTokens = maxTokens;
+  maxTokensPerCandidate: number;
+  constructor(maxTokensPerCandidate = 150) {
+    this.maxTokensPerCandidate = maxTokensPerCandidate;
   }
 
   /**
-   * Given a batch of BankTestCase, ask the LLM to score each one.
-   * Returns an array of ValidatedCase with qualityScore and justification.
+   * Validate each BankTestCase separately, returning an array of ValidatedCase.
+   * By scoring one candidate at a time, we guarantee the model only needs to return a single JSON object,
+   * eliminating any chance of a truncated or malformed JSON‐array response.
    */
-  async validateBatch(
-    candidates: BankTestCase[]
-  ): Promise<ValidatedCase[]> {
-    if (candidates.length === 0) return [];
+  async validateBatch(candidates: BankTestCase[]): Promise<ValidatedCase[]> {
+    const validated: ValidatedCase[] = [];
 
-    const inputArrayString = JSON.stringify(
-      candidates.map((c) => ({ input: c.input, expected_output: c.expected_output })),
-      null,
-      2
-    );
+    for (const candidate of candidates) {
+      // Build a prompt that asks for exactly one JSON object per candidate
+      const prompt = `
+You are a bank‐chatbot test‐case quality assessor. Evaluate this single test case:
 
-    const prompt = `
-You are a bank‐chatbot test‐case quality assessor. Below is a JSON array of candidate test cases. For each case, give:
-  • A "qualityScore" from 1 (very easy/obvious question) to 10 (extremely niche/edge‐case/difficult).
-  • A one‐sentence "justification" explaining why you gave that score.
+  Input (question): "${candidate.input.replace(/"/g, '\\"')}"
+  Expected Output (answer): "${candidate.expected_output.replace(/"/g, '\\"')}"
+  Difficulty: ${candidate.difficulty}
 
-Input array:
-${inputArrayString}
+Please respond with exactly one JSON object (no surrounding text) using this schema:
 
-Return a pure JSON array of objects with this schema, in the same order:
-[
-  {
-    "input": "<same as candidate input>",
-    "expected_output": "<same as candidate expected_output>",
-    "difficulty": <same difficulty number>,
-    "qualityScore": <integer 1–10>,
-    "justification": "<brief explanation>"
-  },
-  …
-]
+{
+  "qualityScore": <integer from 1 to 10>,
+  "justification": "<one-sentence explanation>"
+}
+
+Where "qualityScore" indicates how challenging this test case is (1 = trivial, 10 = extremely niche/edge case). The justification should be a brief sentence explaining why you chose that score.
 `;
 
-    const completion = await generateText({
-      model: openai("gpt-3.5-turbo"),
-      prompt,
-      max_tokens: this.maxTokens,
-      temperature: 0.0,
-    });
+      const completion = await generateText({
+        model: openai("gpt-3.5-turbo"),
+        prompt,
+        maxTokens: this.maxTokensPerCandidate,
+        temperature: 0.0, // deterministic
+      });
 
-    console.log("\n⟳ [Validator] Raw validation output:\n", completion.text);
+      console.log("\n⟳ [Validator] Raw output for one candidate:\n", completion.text);
 
-    let parsed: unknown[] = [];
-    try {
-      parsed = JSON.parse(completion.text) as unknown[];
-    } catch (err) {
-      console.error("❌ [Validator] Failed to parse JSON:", err);
-      return [];
-    }
+      // Extract the first {...} substring from the raw text
+      const raw = completion.text.trim();
+      const objectStart = raw.indexOf("{");
+      const objectEnd = raw.lastIndexOf("}");
+      if (objectStart === -1 || objectEnd === -1 || objectEnd <= objectStart) {
+        console.error("❌ [Validator] Could not find a valid JSON object in:\n", raw);
+        continue; // skip this candidate if parsing fails
+      }
 
-    const validated: ValidatedCase[] = [];
-    for (let i = 0; i < parsed.length; i++) {
-      const item = parsed[i] as any;
-      const base = candidates[i];
+      const jsonObjectString = raw.slice(objectStart, objectEnd + 1);
+
+      let parsed: { qualityScore: number; justification: string };
+      try {
+        parsed = JSON.parse(jsonObjectString);
+      } catch (err) {
+        console.error("❌ [Validator] JSON.parse failed on single‐object:", err);
+        continue;
+      }
+
+      // Only push if parsed fields are correct
       if (
-        item &&
-        typeof item.qualityScore === "number" &&
-        typeof item.justification === "string"
+        typeof parsed.qualityScore === "number" &&
+        typeof parsed.justification === "string"
       ) {
         validated.push({
-          input: base.input,
-          expected_output: base.expected_output,
-          difficulty: base.difficulty,
-          qualityScore: item.qualityScore,
-          justification: item.justification,
+          input: candidate.input,
+          expected_output: candidate.expected_output,
+          difficulty: candidate.difficulty,
+          qualityScore: parsed.qualityScore,
+          justification: parsed.justification,
         });
+      } else {
+        console.error("❌ [Validator] Parsed object missing required fields:", parsed);
       }
     }
+
     return validated;
   }
 }

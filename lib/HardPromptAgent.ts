@@ -32,8 +32,8 @@ export class HardPromptAgent {
     const completion = await generateText({
       model: openai("gpt-3.5-turbo"),
       prompt,
-      max_tokens: 800,
-      temperature: 0.9, // higher temperature for more variation
+      maxTokens: 800,      // ← changed to maxTokens
+      temperature: 0.9,
     });
 
     console.log("\n⟳ [HardPromptAgent] Raw generator output:\n", completion.text);
@@ -46,7 +46,6 @@ export class HardPromptAgent {
       return [];
     }
 
-    // Convert to BankTestCase[] if structurally valid
     const cases: BankTestCase[] = [];
     for (const item of parsed) {
       if (
@@ -69,15 +68,10 @@ export class HardPromptAgent {
       }
     }
 
-    // Increase difficulty for next call
     this.difficultyLevel += 1;
     return cases.slice(0, this.targetCount);
   }
 
-  /**
-   * Build the prompt for the LLM, given a difficulty level.
-   * The higher difficulty => more obscure/niche scenarios.
-   */
   private buildPrompt(
     difficultyLevel: number,
     count: number
